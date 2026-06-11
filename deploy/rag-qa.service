@@ -1,0 +1,16 @@
+[Unit]
+Description=OpinionRAG - Game Opinion Q&A Backend
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rag-qa/backend
+ExecStart=/opt/rag-qa/venv/bin/gunicorn -w 1 -b 127.0.0.1:8002 --timeout 300 --graceful-timeout 30 app:app
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_ENDPOINT=https://hf-mirror.com
+
+[Install]
+WantedBy=multi-user.target

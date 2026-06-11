@@ -1,0 +1,13 @@
+Flask>=2.3
+flask-cors>=4.0
+chromadb>=0.4
+sentence-transformers>=2.2
+openai>=1.30
+requests>=2.31
+python-dotenv>=1.0
+pymysql>=1.1
+numpy>=1.26
+tqdm>=4.60
+rank-bm25
+jieba
+gunicorn
