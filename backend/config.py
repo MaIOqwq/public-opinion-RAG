@@ -29,6 +29,13 @@ class Config:
     TOP_K = int(os.getenv('TOP_K', '15'))
     CONTEXT_MAX_LENGTH = int(os.getenv('CONTEXT_MAX_LENGTH', '4000'))
 
+    # MySQL (Text-to-SQL)
+    MYSQL_HOST = os.getenv('MYSQL_HOST', '127.0.0.1')
+    MYSQL_PORT = int(os.getenv('MYSQL_PORT', '3306'))
+    MYSQL_USER = os.getenv('MYSQL_USER', 'root')
+    MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD', '')
+    MYSQL_DATABASE = os.getenv('MYSQL_DATABASE', 'standardized_data')
+
     # Hybrid search
     BM25_ENABLED = os.getenv('BM25_ENABLED', 'true').lower() == 'true'
     HYBRID_TOP_K = int(os.getenv('HYBRID_TOP_K', '20'))

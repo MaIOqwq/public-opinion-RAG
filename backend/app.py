@@ -1,11 +1,13 @@
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
+import pymysql
 
 from config import Config
 from vector_db import VectorDBManager
@@ -251,7 +253,11 @@ def _extract_filters(question: str) -> dict:
     return result
 
 
+# ── ChromaDB WHERE clause builder ──
+
 def _build_where(filters: dict) -> Optional[Dict[str, Any]]:
+    """Convert extracted filters to ChromaDB WHERE clause (sentiment only).
+    keyword/platform/type done in _filter_by_meta for reliability."""
     conditions = []
     sent = {}
     if filters.get("sentiment_max") is not None:
@@ -265,6 +271,123 @@ def _build_where(filters: dict) -> Optional[Dict[str, Any]]:
     if len(conditions) == 1:
         return conditions[0]
     return {"$and": conditions}
+
+
+# ── Text-to-SQL for keyword-less queries ──
+
+MYSQL_SCHEMA = """
+表名: standardized_data
+字段:
+  keyword (VARCHAR): 游戏名称 (注意: "手机游戏" 是泛用标签不是具体游戏，查询时过滤掉)
+  platform (TINYINT): 0=B站 1=NGA
+  type (VARCHAR): post/video/comment/reply
+  author (VARCHAR): 作者名
+  title_clean (TEXT): 标题
+  content_clean (TEXT): 正文内容
+  publish_time (DATETIME): 发布时间
+  hot_score (DOUBLE): 热度分数
+  sentiment_score (DOUBLE): 情感分数 0~1, >0.5偏正面 <0.5偏负面
+  view_count (INT): 播放/阅读数
+  like_count (INT): 点赞数
+  comment_count (INT): 评论数
+  board_name (VARCHAR): 板块名
+"""
+
+SQL_PROMPT = """你是一个MariaDB SQL专家。根据用户问题和下表结构，生成一条SQL查询。
+
+{schema}
+
+用户问题: {question}
+
+要求:
+1. 只输出SQL语句，不要任何解释，不要markdown代码块
+2. 只生成SELECT语句，禁止INSERT/UPDATE/DELETE/DROP
+3. 涉及多个游戏比较/排名时用 GROUP BY keyword
+4. 排序用 ORDER BY，限制用 LIMIT
+5. 时间筛选用 publish_time，平台: platform=0(B站) platform=1(NGA)
+6. 情感筛选用 sentiment_score
+7. LIMIT 不超过 50"""
+
+
+def _text_to_sql(question: str) -> Optional[str]:
+    """Ask LLM to generate SQL from natural language question."""
+    try:
+        response = llm_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{
+                "role": "system",
+                "content": SQL_PROMPT.format(schema=MYSQL_SCHEMA, question=question)
+            }],
+            temperature=0,
+            max_tokens=400,
+            timeout=10,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(lines[1:])
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        raw = raw.strip()
+
+        if not raw.upper().startswith("SELECT"):
+            logger.warning("Text-to-SQL returned non-SELECT: %s", raw[:100])
+            return None
+        for kw in ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE"]:
+            if kw in raw.upper():
+                logger.warning("Text-to-SQL returned dangerous SQL: %s", raw[:100])
+                return None
+
+        logger.info("Text-to-SQL: %s", raw)
+        return raw
+    except Exception as e:
+        logger.warning("Text-to-SQL LLM call failed: %s", str(e))
+        return None
+
+
+def _execute_sql(sql: str) -> tuple:
+    """Execute SQL against MariaDB. Returns (rows: list of dict, error: str or None)."""
+    conn = None
+    try:
+        conn = pymysql.connect(
+            host=Config.MYSQL_HOST, port=Config.MYSQL_PORT,
+            user=Config.MYSQL_USER, password=Config.MYSQL_PASSWORD,
+            database=Config.MYSQL_DATABASE,
+            charset='utf8mb4', connect_timeout=3, read_timeout=10,
+        )
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        cur.execute(sql)
+        rows = cur.fetchall()
+        return rows, None
+    except Exception as e:
+        logger.error("SQL execution failed: %s", str(e))
+        return [], str(e)
+    finally:
+        if conn:
+            conn.close()
+
+
+def _build_sql_result_context(rows: List[dict], question: str) -> str:
+    """Format SQL results as readable context for LLM."""
+    if not rows:
+        return "【数据库查询结果】未找到匹配数据"
+
+    lines = [f"【数据库查询结果】共{len(rows)}条："]
+    for i, r in enumerate(rows, 1):
+        parts = []
+        for k, v in r.items():
+            if v is None:
+                continue
+            if isinstance(v, float):
+                v = round(v, 3)
+            elif hasattr(v, 'strftime'):
+                v = v.strftime('%Y-%m-%d %H:%M')
+            elif isinstance(v, str) and len(str(v)) > 80:
+                v = str(v)[:80] + "..."
+            parts.append(f"{k}={v}")
+        lines.append(f"[{i}] " + " | ".join(parts))
+
+    return "\n".join(lines)
 
 
 def _filter_by_time(results, time_after=None, time_before=None):
@@ -426,6 +549,55 @@ def rag_query():
     logger.info("Query: %s", question)
 
     filters = _extract_filters(question)
+    keyword = filters.get("keyword") if filters else None
+
+    # Path B: No keyword → Text-to-SQL
+    if not keyword:
+        sql_rows = []
+        sql = _text_to_sql(question)
+        if sql:
+            rows, sql_error = _execute_sql(sql)
+            if rows and not sql_error:
+                sql_rows = rows
+                logger.info("Text-to-SQL returned %d rows", len(rows))
+
+        if sql_rows:
+            sql_context = _build_sql_result_context(sql_rows, question)
+            prompt = Config.PROMPT_TEMPLATE.format(context=sql_context, question=question)
+            sources = [f"SQL: {sql}"]
+
+            def generate():
+                full_answer = []
+                try:
+                    stream = llm_client.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=Config.TEMPERATURE,
+                        max_tokens=Config.MAX_TOKENS,
+                        stream=True,
+                        timeout=30,
+                    )
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            full_answer.append(delta)
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': delta})}\n\n"
+
+                    elapsed = time.time() - start_time
+                    answer = "".join(full_answer)
+                    logger.info("Text-to-SQL done in %.2fs | answer=%d chars", elapsed, len(answer))
+                    yield f"data: {json.dumps({'type': 'done', 'sources': sources, 'answer': answer})}\n\n"
+                except Exception as e:
+                    logger.error("Text-to-SQL LLM error: %s", str(e))
+                    yield f"data: {json.dumps({'type': 'error', 'content': '查询失败请稍后重试'})}\n\n"
+
+            return Response(
+                stream_with_context(generate()),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+            )
+        # SQL failed → fall through to dense search below
+
     where = _build_where(filters)
     search_terms = filters.get("search_terms") if filters else None
 
@@ -534,12 +706,33 @@ def debug_search():
         return jsonify({"success": False, "error": "Question is required"}), 400
 
     filters = _extract_filters(question)
+    keyword = filters.get("keyword") if filters else None
+
+    # Path B: No keyword → Text-to-SQL
+    if not keyword:
+        sql_rows = []
+        sql = _text_to_sql(question)
+        if sql:
+            rows, sql_error = _execute_sql(sql)
+            if rows and not sql_error:
+                sql_rows = rows
+
+        if sql_rows:
+            return jsonify({
+                "success": True,
+                "mode": "text_to_sql",
+                "sql": sql,
+                "total": len(sql_rows),
+                "filters": filters,
+                "results": sql_rows,
+            })
+        # SQL failed → fall through to dense search below
+
     where = _build_where(filters)
     search_terms = filters.get("search_terms") if filters else None
 
     time_after = filters.get("time_after") if filters else None
     time_before = filters.get("time_before") if filters else None
-    keyword = filters.get("keyword") if filters else None
     has_other = bool((filters or {}).get("platform") or (filters or {}).get("type") or time_after or time_before)
     fetch_k = Config.HYBRID_TOP_K
     if has_other:
