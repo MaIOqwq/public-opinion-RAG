@@ -35,13 +35,11 @@ llm_client = OpenAI(
     base_url="https://api.deepseek.com/v1"
 )
 
-
 # ── Gunicorn post-fork hook ──
 
 def post_fork(server, worker):
     """Reinitialize ChromaDB client after fork (--preload safe)."""
     vector_db.reconnect()
-
 
 # ── Known game keywords (from DB) ──
 GAME_KEYWORDS = [
@@ -52,13 +50,134 @@ GAME_KEYWORDS = [
     "金铲铲之战", "阴阳师", "鸣潮",
 ]
 
+# Alias map: slang/abbreviation → official keyword
+GAME_ALIASES = {
+    "吃鸡": "和平精英",
+    "农药": "王者荣耀",
+    "lol手游": "英雄联盟手游",
+    "联盟手游": "英雄联盟手游",
+    "三角洲": "三角洲行动",
+    "方舟": "明日方舟",
+    "终末地": "明日方舟终末地",
+    "星铁": "崩坏星穹铁道",
+    "崩铁": "崩坏星穹铁道",
+    "三崩子": "崩坏三",
+    "第五": "第五人格",
+    "暖暖": "无限暖暖",
+    "逆水寒": "逆水寒手游",
+    "燕云": "燕云十六声",
+    "绝区": "绝区零",
+    "zzz": "绝区零",
+    "火影": "火影忍者手游",
+    "永劫": "永劫无间手游",
+    "金铲铲": "金铲铲之战",
+    "铲铲": "金铲铲之战",
+}
+
+
+def _extract_keyword_local(question: str) -> Optional[str]:
+    """Extract game keyword via local string matching.
+    Two-pass: exact match first, then alias/substring match.
+    Returns None if no match."""
+    # Pass 1: exact full-name match (most reliable, handles compound names)
+    for kw in GAME_KEYWORDS:
+        if kw in question:
+            logger.info("Keyword (exact match): %s", kw)
+            return kw
+
+    # Pass 2: alias match
+    for alias, official in GAME_ALIASES.items():
+        if alias in question:
+            logger.info("Keyword (alias: %s -> %s)", alias, official)
+            return official
+
+    return None
+
+
+def _extract_keyword_llm(question: str) -> Optional[str]:
+    """Fallback: use LLM to extract game name.
+    Only called when local matching fails (e.g., new aliases, typos)."""
+    try:
+        response = llm_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{
+                "role": "system",
+                "content": (
+                    "You are a game name extractor. Extract the video game name"
+                    " mentioned in the user's question.\n"
+                    f"Known game list: {', '.join(GAME_KEYWORDS)}\n"
+                    'Output ONLY: {"keyword": "game_name"} or {"keyword": null}\n'
+                    "No other output."
+                )
+            }, {
+                "role": "user",
+                "content": question
+            }],
+            temperature=0,
+            max_tokens=30,
+            timeout=5,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        result = json.loads(raw)
+        kw = result.get("keyword")
+        if kw and isinstance(kw, str) and kw.strip():
+            kw = kw.strip()
+            for gk in GAME_KEYWORDS:
+                if kw == gk:
+                    logger.info("Keyword (LLM): %s", kw)
+                    return kw
+        return None
+    except Exception as e:
+        logger.warning("Keyword LLM extraction failed: %s", str(e))
+        return None
+
+
+def _extract_platform_local(question: str) -> Optional[str]:
+    if "B站" in question or "b站" in question or "bilibili" in question.lower():
+        return "B站"
+    if "NGA" in question or "nga" in question.lower():
+        return "NGA"
+    return None
+
+
+def _extract_time_local(question: str) -> tuple:
+    """Returns (time_after, time_before) or (None, None)."""
+    import re
+    now = datetime.now()
+    if re.search(r'昨天', question):
+        d = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+        return d, d
+    elif re.search(r'今天|今日', question):
+        d = now.strftime('%Y-%m-%d')
+        return d, None
+    elif re.search(r'最近一周|近7天|这周|本周|最近七天', question):
+        return (now - timedelta(days=7)).strftime('%Y-%m-%d'), None
+    elif re.search(r'最近三天|近3天', question):
+        return (now - timedelta(days=3)).strftime('%Y-%m-%d'), None
+    elif re.search(r'最近一个月|近30天|这一个月', question):
+        return (now - timedelta(days=30)).strftime('%Y-%m-%d'), None
+    return None, None
+
+
+def _extract_sentiment_local(question: str) -> tuple:
+    """Returns (sentiment_min, sentiment_max) or (None, None)."""
+    import re
+    neg = re.search(r'节奏|争议|喷|冲|炎上|骂|负面|差评|吐槽|翻车|暴死|烂', question)
+    pos = re.search(r'吹爆|好评|正面|良心|推荐|安利|好玩|必玩', question)
+    if neg:
+        return None, 0.4
+    if pos:
+        return 0.6, None
+    return None, None
+
 
 # ── Pipeline: step 1 – Structured filter extraction ──
 
 def _build_search_query(question: str, filters: dict) -> str:
-    """Inject game keyword into query to boost dense embedding signal.
-    bge-small-zh-v1.5 prioritizes semantic similarity over keyword matching.
-    Prepending the keyword 3x makes the embedding vector more keyword-aware."""
     kw = (filters or {}).get("keyword")
     if kw:
         return f"{kw} {kw} {kw} {question}"
@@ -66,73 +185,74 @@ def _build_search_query(question: str, filters: dict) -> str:
 
 
 def _extract_filters(question: str) -> dict:
-    """LLM extracts structured ChromaDB WHERE conditions from user question.
-    Returns empty dict on failure (caller falls back to unfiltered search)."""
+    """Hybrid extraction: local regex for keyword/platform/time/sentiment (fast & reliable),
+    LLM enrichment for search_terms and complex queries (optional)."""
     if not Config.STRUCTURED_FILTER_ENABLED:
         return {}
+
+    # Step 1: Local extraction (fast, deterministic)
+    keyword = _extract_keyword_local(question)
+    platform = _extract_platform_local(question)
+    time_after, time_before = _extract_time_local(question)
+    sentiment_min, sentiment_max = _extract_sentiment_local(question)
+
+    result = {
+        "keyword": keyword,
+        "platform": platform,
+        "time_after": time_after,
+        "time_before": time_before,
+        "sentiment_max": sentiment_max,
+        "sentiment_min": sentiment_min,
+        "type": None,
+        "search_terms": None,
+    }
+
+    # Step 2: LLM enrichment for search_terms and type only (lightweight)
     try:
         response = llm_client.chat.completions.create(
             model="deepseek-chat",
             messages=[{
                 "role": "system",
-                "content": f"""你是搜索条件提取器。从用户问题提取结构化过滤条件，输出JSON。
-
-今天是{datetime.now().strftime("%Y年%m月%d日")}。所有时间相关的计算必须以今天为基准。
-
-可用字段:
-- keyword: 游戏名，必须是以下之一: {", ".join(GAME_KEYWORDS)}
-  如果用户没提具体游戏名，填null
-- platform: "B站" 或 "NGA"。未提及填null
-- time_after: 开始日期 "YYYY-MM-DD"。未提及填null
-- time_before: 结束日期 "YYYY-MM-DD"。未提及填null
-- sentiment_max: 0.0~1.0，查负面内容时设<=0.4。未提及填null
-- sentiment_min: 0.0~1.0，查正面内容时设>=0.6。未提及填null
-- type: "post"/"comment"/"video"/"reply"。未提及填null
-- search_terms: 搜索关键词补充(空格分隔)，扩展用户意图的同义词
-
-规则:
-1. 只有明确的时间限定才设time_after: "最近一周/近7天/这周" -> 7天前; "昨天" -> time_after和time_before都设昨天; "今天" -> time_after设今天
-   注意: "最近有什么"/"最近讨论"/"最近热门"这类泛指"当前"但不限时间的，不要设time_after
-3. "今天" -> time_after设为今天
-4. "节奏/争议/喷/冲/负面/骂/炎上" -> sentiment_max=0.4
-5. "吹爆/好评/正面/良心" -> sentiment_min=0.6
-6. "视频" -> type="video"
-7. "最火/排行/热度最高" -> 不设keyword，search_terms填"热度 热门 排行"
-8. 未提及的字段填null
-9. 只输出JSON，不要任何解释"""
+                "content": (
+                    "从用户问题提取补充搜索条件。只输出JSON。\n"
+                    "字段:\n"
+                    "- search_terms: 扩展用户意图的搜索词(空格分隔)。未提及填null\n"
+                    "规则: \"排行/最火/热度最高\" -> search_terms=\"热度 热门\"\n"
+                    "只输出JSON，不要解释"
+                )
             }, {
                 "role": "user",
                 "content": question
             }],
             temperature=0.1,
-            max_tokens=150,
+            max_tokens=80,
             timeout=5,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1]
             if raw.endswith("```"):
                 raw = raw[:-3]
-        result = json.loads(raw)
-        # Fallback: if LLM missed the game name, simple string match
-        if not result.get("keyword"):
-            for kw in GAME_KEYWORDS:
-                if kw in question:
-                    result["keyword"] = kw
-                    break
-        logger.info("Filters: %s", json.dumps(result, ensure_ascii=False))
-        return result
+        enriched = json.loads(raw)
+        for field in ["search_terms"]:
+            val = enriched.get(field)
+            if val is not None:
+                result[field] = val
     except Exception as e:
-        logger.warning("Filter extraction failed (fallback to unfiltered): %s", str(e))
-        return {}
+        logger.warning("Enrichment failed: %s", str(e))
+
+    # Step 3: If keyword still null and STRICT mode, try LLM as last resort
+    if not keyword:
+        llm_kw = _extract_keyword_llm(question)
+        if llm_kw:
+            result["keyword"] = llm_kw
+
+    logger.info("Filters: %s", json.dumps(result, ensure_ascii=False))
+    return result
 
 
 def _build_where(filters: dict) -> Optional[Dict[str, Any]]:
-    """Convert extracted filters to ChromaDB WHERE clause.
-    keyword/platform/type moved to post-filter for reliability (ChromaDB 1.5.9 buggy)."""
     conditions = []
-    # Sentiment only — keyword/platform/type done in _filter_by_meta
     sent = {}
     if filters.get("sentiment_max") is not None:
         sent["$lte"] = float(filters["sentiment_max"])
@@ -140,7 +260,6 @@ def _build_where(filters: dict) -> Optional[Dict[str, Any]]:
         sent["$gte"] = float(filters["sentiment_min"])
     if sent:
         conditions.append({"sentiment_score": sent})
-
     if not conditions:
         return None
     if len(conditions) == 1:
@@ -148,10 +267,7 @@ def _build_where(filters: dict) -> Optional[Dict[str, Any]]:
     return {"$and": conditions}
 
 
-# ── Pipeline: step 2-4 – Context building ──
-
 def _filter_by_time(results, time_after=None, time_before=None):
-    """Post-search time filter. ChromaDB 1.5.9 doesn't support string $gte/$lte."""
     if not time_after and not time_before:
         return results
     filtered = []
@@ -169,7 +285,6 @@ def _filter_by_time(results, time_after=None, time_before=None):
 
 
 def _filter_by_meta(results, filters):
-    """Post-search meta filter. keyword/platform/type — more reliable than ChromaDB WHERE."""
     keep = []
     for r in results:
         meta = r.get("metadata", {})
@@ -310,15 +425,10 @@ def rag_query():
 
     logger.info("Query: %s", question)
 
-    # 1. Structured filter extraction
     filters = _extract_filters(question)
     where = _build_where(filters)
     search_terms = filters.get("search_terms") if filters else None
 
-    # 2. Search
-    # Keyword uses collection.get() pre-filter + embedding re-rank (works around
-    # ChromaDB WHERE being post-ANN filter, which yields too few keyword matches).
-    # Other filters (platform/type) are post-filtered by _filter_by_meta.
     time_after = filters.get("time_after") if filters else None
     time_before = filters.get("time_before") if filters else None
     keyword = filters.get("keyword") if filters else None
@@ -327,7 +437,7 @@ def rag_query():
     if has_other:
         fetch_k = max(fetch_k, 200)
     if time_after or time_before:
-        fetch_k = max(fetch_k, 10000)  # Time filter post-retrieval: wide pool needed
+        fetch_k = max(fetch_k, 10000)
 
     search_query = _build_search_query(question, filters)
     if keyword:
@@ -348,14 +458,11 @@ def rag_query():
     else:
         search_results = vector_db.search_dense(search_query, fetch_k, where)
 
-    # 3. Post-search meta filter (keyword/platform/type — more reliable than ChromaDB WHERE)
     search_results = _filter_by_meta(search_results, filters)
 
-    # 4. Post-search time filter (ChromaDB WHERE doesn't support string dates)
     if time_after or time_before:
         search_results = _filter_by_time(search_results, time_after, time_before)
 
-    # 5. Dedup + trim
     if Config.DEDUP_ENABLED:
         search_results = _dedup_results(search_results)
     search_results = search_results[:Config.TOP_K]
@@ -368,7 +475,6 @@ def rag_query():
             "filters": filters,
         })
 
-    # 4. Build context + generate
     context = build_context(search_results, Config.CONTEXT_MAX_LENGTH)
     prompt = Config.PROMPT_TEMPLATE.format(context=context, question=question)
     sources = [format_source(r["metadata"]) for r in search_results]
@@ -417,11 +523,6 @@ def health_check():
         "llm_provider": Config.LLM_PROVIDER,
         "bm25_enabled": Config.BM25_ENABLED,
         "structured_filter": Config.STRUCTURED_FILTER_ENABLED,
-        "query_expansion": Config.QUERY_EXPANSION_ENABLED,
-        "time_decay": Config.TIME_DECAY_ENABLED,
-        "hot_boost": Config.HOT_BOOST_ENABLED,
-        "dedup": Config.DEDUP_ENABLED,
-        "diversity": Config.DIVERSITY_ENABLED,
     })
 
 
@@ -448,7 +549,7 @@ def debug_search():
 
     search_query = _build_search_query(question, filters)
     if keyword:
-        results = vector_db.search_by_keyword(search_query, keyword, top_k=fetch_k)
+        results = vector_db.search_by_keyword(search_query, keyword, top_k=fetch_k, fetch_k=fetch_k)
     elif Config.BM25_ENABLED:
         results = vector_db.hybrid_search(
             query=search_query,
